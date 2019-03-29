@@ -1,0 +1,426 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  S3DataBucketName:
+    Description: Name to create S3 bucket that will hold training data and model artifacts.
+    Type: String
+  CloudWatchMetricName:
+    Description: Name of the metric to use for training and for finding anomalies.
+    Type: String
+  CloudWatchMetricPeriodInSeconds:
+    Description: CloudWatch Aggregation period for metrics. Defaults to 5 minutes.
+    Type: String
+    Default: 300
+  CloudWatchMetricStatistic:
+    Description: Statistic to use. Defaults to average, but can be min, max etc.
+    Type: String
+    Default: Average
+  CloudWatchNamespace:
+    Description: CloudWatch Namespace in which the metric resides.
+    Type: String
+  SageMakerRoleArn:
+    Description: ARN of IAM role SageMaker can assume to access model artifacts and docker image for training and deployment on ML compute instances.
+    Type: String
+  SageMakerTrainingInstanceType:
+    Description: Instance type to launch the training job with.
+    Type: String
+    Default: ml.c5.xlarge
+  SageMakerTrainingInstanceCount:
+    Description: Number of instances to launch the training job with.
+    Type: String
+    Default: 1
+  SageMakerTrainingVolumeSize:
+    Description: Additional volume to provide to instance for training
+    Type: String
+    Default: 10
+  SageMakerTrainingNumTrees:
+    Description: RCF Hyperparameter, specifies how many trees to use in the model.
+    Type: String
+    Default: 50
+  SageMakerTrainingNumSamplesPerTree:
+    Description: RCF Hyperparameter, specifies how many samples per tree to use in the model.
+    Type: String
+    Default: 100
+  SagemakerTransformInstanceType:
+    Description: Instance type to launch the transform job with.
+    Type: String
+    Default: ml.c5.xlarge
+  SagemakerTransformInstanceCount:
+    Description: Number of instances to launch the transform job with.
+    Type: String
+    Default: 1
+
+Resources:
+  RunTrainingMonthlyRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: RunTrainingMonthlyRule
+      ScheduleExpression: rate(30 days)
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !Ref SageMakerTrainingStateMachine
+          Id: "RunTrainingMonthlyRuleV1"
+          RoleArn: !GetAtt ExecuteStateMachineRole.Arn
+          Input: '{"jobType": "training", "timeRangeInDays": 30}'
+
+  RunTransformWeeklyRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: RunTransformWeeklyRule
+      ScheduleExpression: rate(7 days)
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !Ref SageMakerTransformStateMachine
+          Id: "RunTransformWeeklyRuleV1"
+          RoleArn: !GetAtt ExecuteStateMachineRole.Arn
+          Input: '{"jobType": "transform", "timeRangeInDays": 7}'
+
+  ExecuteStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "AllowCWEServiceToAssumeRole"
+            Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "ExecuteStateMachine"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "states:StartExecution"
+                Resource: "*"
+
+  SageMakerTrainingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |-
+        {
+          "Comment": "A state machine that submits a Job to AWS SageMaker and monitors the Job until it completes.",
+          "StartAt": "Store CloudWatch Metric Data In S3",
+          "States": {
+            "Store CloudWatch Metric Data In S3": {
+              "Type": "Task",
+              "Resource": "${UploadMetricDataToS3.Arn}",
+              "Next": "Start SageMaker Training Job"
+            },
+            "Start SageMaker Training Job": {
+              "Type": "Task",
+              "Resource": "${StartTrainingJob.Arn}",
+              "Next": "Wait 2 Minutes"
+            },
+            "Wait 2 Minutes": {
+              "Type": "Wait",
+              "Seconds": 120,
+              "Next": "Get SageMaker Training Job Status"
+            },
+            "Get SageMaker Training Job Status": {
+              "Type": "Task",
+              "Resource": "${CheckTrainingJobStatus.Arn}",
+              "Next": "SageMaker Training Job Complete?"
+            },
+            "SageMaker Training Job Complete?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.trainingJobStatus",
+                  "StringEquals": "Failed",
+                  "Next": "SageMaker Training Job Failed"
+                },
+                {
+                  "Variable": "$.trainingJobStatus",
+                  "StringEquals": "Completed",
+                  "Next": "Create SageMakerModel"
+                }
+              ],
+              "Default": "Wait 2 Minutes"
+            },
+            "SageMaker Training Job Failed": {
+              "Type": "Fail",
+              "Cause": "AWS Batch Job Failed",
+              "Error": "DescribeJob returned FAILED"
+            },
+            "Create SageMakerModel": {
+              "Type": "Task",
+              "Resource": "${CreateModel.Arn}",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+
+  SageMakerTransformStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |-
+        {
+          "Comment": "A state machine that submits a Job to AWS SageMaker and monitors the Job until it completes.",
+          "StartAt": "Store CloudWatch Metric Data In S3",
+          "States": {
+            "Store CloudWatch Metric Data In S3": {
+              "Type": "Task",
+              "Resource": "${UploadMetricDataToS3.Arn}",
+              "Next": "Start SageMaker Transform Job"
+            },
+            "Start SageMaker Transform Job": {
+              "Type": "Task",
+              "Resource": "${StartTransformJob.Arn}",
+              "Next": "Wait 2 Minutes"
+            },
+            "Wait 2 Minutes": {
+              "Type": "Wait",
+              "Seconds": 120,
+              "Next": "Get SageMaker Transform Job Status"
+            },
+            "Get SageMaker Transform Job Status": {
+              "Type": "Task",
+              "Resource": "${CheckTransformJobStatus.Arn}",
+              "Next": "SageMaker Transform Job Complete?"
+            },
+            "SageMaker Transform Job Complete?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.transformJobStatus",
+                  "StringEquals": "Failed",
+                  "Next": "SageMaker Transform Job Failed"
+                },
+                {
+                  "Variable": "$.transformJobStatus",
+                  "StringEquals": "Completed",
+                  "Next": "Publish Anomaly Score Metric To CloudWatch"
+                }
+              ],
+              "Default": "Wait 2 Minutes"
+            },
+            "SageMaker Transform Job Failed": {
+              "Type": "Fail",
+              "Cause": "AWS Batch Job Failed",
+              "Error": "DescribeJob returned FAILED"
+            },
+            "Publish Anomaly Score Metric To CloudWatch": {
+              "Type": "Task",
+              "Resource": "${UploadAnomalousMetricScores.Arn}",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+
+  StepFunctionExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: !Sub states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref S3DataBucketName
+
+  UploadMetricDataToS3:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: com.amazonaws.serverless.cloudwatch.DataUploadHandler::handleRequest
+      Runtime: java8
+      Timeout: 300
+      MemorySize: 512
+      CodeUri: ../target/sagemaker-serverless-anomaly-detection-1.0.jar
+      Description: 'Uploads CloudWatch metric data to desired S3 bucket'
+      Environment:
+        Variables:
+          CLOUDWATCH_METRIC_NAME: !Ref CloudWatchMetricName
+          CLOUDWATCH_METRIC_PERIOD_IN_SECONDS: !Ref CloudWatchMetricPeriodInSeconds
+          CLOUDWATCH_METRIC_STATISTIC: !Ref CloudWatchMetricStatistic
+          CLOUDWATCH_NAMESPACE: !Ref CloudWatchNamespace
+          S3_BUCKET_NAME: !Ref S3DataBucketName
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "cloudwatch:GetMetricStatistics"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - "s3:PutObject"
+              Resource: !Sub 'arn:aws:s3:::${S3DataBucketName}/*'
+
+  StartTrainingJob:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: com.amazonaws.serverless.sagemaker.training.StartTrainingJobHandler::handleRequest
+      Runtime: java8
+      Timeout: 300
+      MemorySize: 512
+      CodeUri: ../target/sagemaker-serverless-anomaly-detection-1.0.jar
+      Description: 'Starts SageMaker training job.'
+      Environment:
+        Variables:
+          SAGEMAKER_ROLE_ARN: !Ref SageMakerRoleArn
+          SAGEMAKER_TRAINING_INSTANCE_COUNT: !Ref SageMakerTrainingInstanceCount
+          SAGEMAKER_TRAINING_INSTANCE_TYPE: !Ref SageMakerTrainingInstanceType
+          SAGEMAKER_TRAINING_NUM_SAMPLES_PER_TREE: !Ref SageMakerTrainingNumSamplesPerTree
+          SAGEMAKER_TRAINING_NUM_TREES: !Ref SageMakerTrainingNumTrees
+          SAGEMAKER_TRAINING_VOLUME_SIZE: !Ref SageMakerTrainingVolumeSize
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:CreateTrainingJob"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - "iam:PassRole"
+              Resource: !Ref SageMakerRoleArn
+
+  CheckTrainingJobStatus:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: com.amazonaws.serverless.sagemaker.training.CheckTrainingJobStatusHandler::handleRequest
+      Runtime: java8
+      Timeout: 300
+      MemorySize: 512
+      CodeUri: ../target/sagemaker-serverless-anomaly-detection-1.0.jar
+      Description: 'Checks the status of SageMaker training job'
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:DescribeTrainingJob"
+              Resource: "*"
+
+  CreateModel:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: com.amazonaws.serverless.sagemaker.training.CreateModelHandler::handleRequest
+      Runtime: java8
+      Timeout: 300
+      MemorySize: 512
+      CodeUri: ../target/sagemaker-serverless-anomaly-detection-1.0.jar
+      Description: 'Creates SageMaker model after the training job has been completed.'
+      Environment:
+        Variables:
+          SAGEMAKER_ROLE_ARN: !Ref SageMakerRoleArn
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:CreateModel"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - "iam:PassRole"
+              Resource: !Ref SageMakerRoleArn
+
+  StartTransformJob:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: com.amazonaws.serverless.sagemaker.transform.StartTransformJobHandler::handleRequest
+      Runtime: java8
+      Timeout: 300
+      MemorySize: 512
+      CodeUri: ../target/sagemaker-serverless-anomaly-detection-1.0.jar
+      Description: 'Starts SageMaker transform job'
+      Environment:
+        Variables:
+          SAGEMAKER_TRANSFORM_INSTANCE_TYPE: !Ref SagemakerTransformInstanceType
+          SAGEMAKER_TRANSFORM_INSTANCE_COUNT: !Ref SagemakerTransformInstanceCount
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:ListModels"
+                - "sagemaker:CreateTransformJob"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - "iam:PassRole"
+              Resource: !Ref SageMakerRoleArn
+
+  CheckTransformJobStatus:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: com.amazonaws.serverless.sagemaker.transform.CheckTransformJobStatusHandler::handleRequest
+      Runtime: java8
+      Timeout: 300
+      MemorySize: 512
+      CodeUri: ../target/sagemaker-serverless-anomaly-detection-1.0.jar
+      Description: 'Checks the status of SageMaker transform job'
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "sagemaker:DescribeTransformJob"
+              Resource: "*"
+
+  UploadAnomalousMetricScores:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: com.amazonaws.serverless.cloudwatch.AnomalousDataUploadHandler::handleRequest
+      Runtime: java8
+      Timeout: 300
+      MemorySize: 512
+      CodeUri: ../target/sagemaker-serverless-anomaly-detection-1.0.jar
+      Description: 'Finds and uploads anomalous metrics from S3 to CloudWatch'
+      Environment:
+        Variables:
+          CLOUDWATCH_METRIC_NAME: !Ref CloudWatchMetricName
+          CLOUDWATCH_NAMESPACE: !Ref CloudWatchNamespace
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "cloudwatch:PutMetricData"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - "s3:GetObject"
+              Resource: !Sub 'arn:aws:s3:::${S3DataBucketName}/*'
+
+Outputs:
+  S3BucketName:
+    Description: S3 bucket that will hold training data and model artifacts
+    Value: !Ref S3DataBucketName
