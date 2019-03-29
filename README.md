@@ -1,6 +1,6 @@
 ## SageMaker Serverless Anomaly Detection
 
-This repository contains the assets for system described in this [ML blog post](TODO LINK TO BLOGPOST).
+This repository contains the assets for system described in this [ML blog post](https://aws.amazon.com/blogs/machine-learning/build-a-serverless-anomaly-detection-tool-using-java-and-the-amazon-sagemaker-random-cut-forest-algorithm/).
 
 It demonstrates how to build a [serverless](https://aws.amazon.com/serverless/#getstarted) anomaly detection system to find anomalies in [CloudWatch metrics](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/working_with_metrics.html) 
 using [Amazon SageMaker](https://aws.amazon.com/sagemaker/), [AWS Step Functions](https://aws.amazon.com/step-functions/), [AWS Lambda](https://aws.amazon.com/lambda/), 
